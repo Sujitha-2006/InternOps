@@ -1,15 +1,23 @@
-const nodemailer = require('nodemailer');
+﻿const nodemailer = require('nodemailer');
 const config = require('../config');
 const pool = require('../config/db');
 const { getRedisClient } = require('../config/redis');
 const path = require('path');
 const fs = require('fs');
-const logger = require('../logger');
 
 const rateLimitMap = new Map();
 const bounceList = new Set();
 
 const metrics = { sent: 0, failed: 0, bounced: 0, retried: 0 };
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 class EmailService {
   constructor() {
@@ -89,24 +97,28 @@ class EmailService {
   _render(templateName, data) {
     const tpl = this.templates[templateName];
     if (!tpl) return { html: null, text: null };
+
     const render = (str) => {
       if (!str) return null;
+
       return str
-        .replace(/\{\{(\w+)\}\}/g, (_, k) => (data[k] != null ? data[k] : ''))
+        .replace(/\{\{(\w+)\}\}/g, (_, k) =>
+          data[k] != null ? escapeHtml(data[k]) : ''
+        )
         .replace(/\{\{#if (\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g, (_, k, content) =>
           data[k]
             ? content.replace(/\{\{(\w+)\}\}/g, (__, kk) =>
-                data[kk] != null ? data[kk] : ''
+                data[kk] != null ? escapeHtml(data[kk]) : ''
               )
             : ''
         );
     };
+
     return {
       html: render(tpl.html),
       text: render(tpl.txt),
     };
   }
-
   _stripHtml(html) {
     return html
       ? html
@@ -144,10 +156,7 @@ class EmailService {
     };
     const transporter = this.getTransporter();
     if (!transporter) {
-      logger.info(
-        { to, subject },
-        '[Email] Placeholder — no transporter configured, skipping send'
-      );
+      console.log(`[Email] Placeholder -> To: ${to}, Subject: "${subject}"`);
       metrics.sent++;
       return {
         messageId: 'console-' + Date.now(),
@@ -272,12 +281,12 @@ class EmailService {
       to: email,
       subject: 'InternOps - Account Lockout Alert',
       html: `
-            <p>Your account has been locked due to <strong>${failedAttempts}</strong> failed login attempts.</p>
-            <p><strong>IP Address:</strong> ${ipAddress}</p>
-            <p><strong>Timestamp:</strong> ${timestamp}</p>
-            <p>If this was not you, please secure your account immediately.</p>
-        `,
-      text: `Your account has been locked due to ${failedAttempts} failed login attempts.\nIP: ${ipAddress}\nTimestamp: ${timestamp}`,
+  <p>Your account has been locked due to <strong>${escapeHtml(failedAttempts)}</strong> failed login attempts.</p>
+  <p><strong>IP Address:</strong> ${escapeHtml(ipAddress)}</p>
+  <p><strong>Timestamp:</strong> ${escapeHtml(timestamp)}</p>
+  <p>If this was not you, please secure your account immediately.</p>
+`,
+      text: `Your account has been locked due to ${escapeHtml(failedAttempts)} failed login attempts.\nIP: ${escapeHtml(ipAddress)}\nTimestamp: ${escapeHtml(timestamp)}`,
     });
   }
 }

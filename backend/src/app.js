@@ -1,6 +1,8 @@
 require('dotenv').config();
 const validateEnv = require('./config/validateEnv');
 validateEnv();
+const auth = require('./middleware/auth');
+const rbac = require('./middleware/rbac');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const Fastify = require('fastify');
@@ -10,38 +12,33 @@ const metrics = require('./utils/metrics');
 const { initializeWebSocket, getIO } = require('./websocket');
 const noticesRoutes = require('./modules/notices/routes');
 const { getRedisStatus } = require('./config/redis');
-const authenticate = require('./middleware/auth');
-const rbac = require('./middleware/rbac');
 const { csrfMiddleware } = require('./middleware/csrf');
 const { sanitizationMiddleware } = require('./middleware/sanitize');
 const { createAuditLog } = require('./utils/audit');
 const { setupCronJobs } = require('./utils/cron');
-const githubSyncOrchestrator = require('./modules/github-sync/orchestrator');
 
 const app = Fastify({
   trustProxy: config.nodeEnv === 'production' ? true : 'loopback',
   logger:
     config.nodeEnv === 'development'
-      ? {
-          transport: { target: 'pino-pretty' },
-          level: process.env.LOG_LEVEL || 'info',
-        }
-      : { level: process.env.LOG_LEVEL || 'info' },
+      ? { transport: { target: 'pino-pretty' } }
+      : true,
   bodyLimit: 1048576,
   genReqId: () => uuidv4(),
 });
 
 // Layer 1: Register monitoring routes BEFORE global middleware to ensure observability
+
 app.get(
   '/metrics',
   {
+    preHandler: [auth, rbac('ADMIN')],
     config: {
       rateLimit: false,
     },
   },
   metrics.metricsEndpoint
 );
-
 app.get(
   '/health',
   {
@@ -55,69 +52,67 @@ app.get(
       return reply.send({ status: 'ok' });
     }
     if (redisStatus === 'disconnected') {
-      return reply.status(503).send({ status: 'degraded' });
+      return reply
+        .status(503)
+        .send({ status: 'degraded', redis: 'disconnected' });
     }
     return reply.send({ status: 'ok' });
   }
 );
 
 app.get(
-  '/health/detailed',
+  '/health/db',
   {
-    preHandler: [authenticate, rbac('ADMIN')],
+    config: {
+      rateLimit: false,
+    },
+  },
+  async (req, reply) => {
+    try {
+      await pool.query('SELECT 1');
+      reply.send({
+        status: 'ok',
+        db: 'connected',
+      });
+    } catch {
+      reply.status(503).send({
+        status: 'error',
+        db: 'disconnected',
+      });
+    }
+  }
+);
+
+app.get(
+  '/health/full',
+  {
     config: {
       rateLimit: false,
     },
   },
   async (req, reply) => {
     const checks = { db: false, redis: false };
-
     try {
       await pool.query('SELECT 1');
       checks.db = true;
     } catch {}
-
     const redisStatus = getRedisStatus();
-
     checks.redis =
       process.env.NODE_ENV === 'test' ||
       redisStatus === 'connected' ||
       redisStatus === 'disabled';
-
     const healthy = checks.db && checks.redis;
-
-    reply.status(healthy ? 200 : 503).send({
-      status: healthy ? 'healthy' : 'degraded',
-      checks,
-    });
+    reply
+      .status(healthy ? 200 : 503)
+      .send({ status: healthy ? 'healthy' : 'degraded', checks });
   }
 );
+
 app.register(require('@fastify/cors'), {
-  origin: (origin, cb) => {
-    // In development mode, allow any localhost or 127.0.0.1 port
-    if (config.nodeEnv !== 'production') {
-      if (
-        !origin ||
-        /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)
-      ) {
-        return cb(null, true);
-      }
-    }
-
-    const configured = Array.isArray(config.corsOrigin)
+  origin:
+    config.nodeEnv === 'production'
       ? config.corsOrigin
-      : typeof config.corsOrigin === 'string' && config.corsOrigin.includes(',')
-        ? config.corsOrigin.split(',').map((o) => o.trim())
-        : [config.corsOrigin];
-
-    if (!origin || configured.includes(origin)) {
-      return cb(null, true);
-    }
-
-    const corsError = new Error('Not allowed by CORS');
-    corsError.statusCode = 403;
-    return cb(corsError, false);
-  },
+      : 'http://localhost:5173',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token'],
@@ -206,7 +201,6 @@ if (process.env.NODE_ENV !== 'test') {
   });
 
   const authMiddleware = require('./middleware/auth');
-  const rbac = require('./middleware/rbac');
 
   app.register(require('@fastify/swagger-ui'), {
     routePrefix: '/api-docs',
@@ -309,16 +303,13 @@ app.addHook('onResponse', async (request, reply) => {
 
   if (!request?.auditOnResponse) return;
 
-  // Only emit audit log for successful responses (status codes 2xx)
-  if (reply.statusCode >= 200 && reply.statusCode < 300) {
-    try {
-      await createAuditLog(request.auditOnResponse);
-    } catch (err) {
-      request.log.error(
-        { err, audit: request.auditOnResponse },
-        'Failed to write deferred audit log'
-      );
-    }
+  try {
+    await createAuditLog(request.auditOnResponse);
+  } catch (err) {
+    request.log.error(
+      { err, audit: request.auditOnResponse },
+      'Failed to write deferred audit log'
+    );
   }
 });
 
@@ -410,7 +401,6 @@ app.setErrorHandler((error, request, reply) => {
 
 if (process.env.NODE_ENV !== 'test') {
   setupCronJobs();
-  githubSyncOrchestrator.initialize();
 }
 
 const start = async () => {
@@ -458,13 +448,6 @@ const gracefulShutdown = async (signal) => {
 
     // Close database pool connections
     await pool.end();
-
-    // Shutdown GitHub sync orchestrator
-    try {
-      githubSyncOrchestrator.shutdown();
-    } catch (syncErr) {
-      app.log.warn({ err: syncErr }, 'Error shutting down GitHub sync');
-    }
 
     clearTimeout(forceShutdown);
     app.log.info('Cleanup completed. Exiting now.');
