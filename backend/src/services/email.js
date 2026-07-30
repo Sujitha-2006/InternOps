@@ -1,6 +1,7 @@
 ﻿const nodemailer = require('nodemailer');
 const config = require('../config');
 const pool = require('../config/db');
+const logger = require('../logger');
 const { getRedisClient } = require('../config/redis');
 const path = require('path');
 const fs = require('fs');
@@ -50,7 +51,7 @@ class EmailService {
       config.email.pass !== 'your-smtp-password' &&
       !config.email.pass.startsWith('your-');
     if (!config.email.host || !hasValidCreds) {
-      console.warn('[Email] SMTP not configured – using console fallback');
+      logger.warn('[Email] SMTP not configured-using console fallback');
       return null;
     }
     this.transporter = nodemailer.createTransport({
@@ -156,7 +157,7 @@ class EmailService {
     };
     const transporter = this.getTransporter();
     if (!transporter) {
-      console.log(`[Email] Placeholder -> To: ${to}, Subject: "${subject}"`);
+      logger.info(`[Email] Placeholder -> To: ${to}, Subject: "${subject}"`);
       metrics.sent++;
       return {
         messageId: 'console-' + Date.now(),
@@ -184,7 +185,7 @@ class EmailService {
         return info;
       } catch (err) {
         lastError = err;
-        console.error(
+        logger.error(
           `[Email] Attempt ${attempt + 1}/${maxRetries + 1} failed for ${to}: ${err.message}`
         );
         if (err.responseCode >= 500 || /55[0135]/.test(err.message)) {
@@ -196,7 +197,7 @@ class EmailService {
     }
 
     metrics.failed++;
-    console.error(
+    logger.error(
       `[Email] All attempts failed for ${to}: ${lastError?.message}`
     );
     throw lastError || new Error(`Failed to send email to ${to}`);
