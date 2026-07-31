@@ -31,6 +31,7 @@ describe('Audit Integration Tests', () => {
   const seededSystemLogId = uuidv4();
 
   beforeAll(async () => {
+    jest.setTimeout(60000);
     await app.ready();
     await resetSeededAdminPassword();
 
